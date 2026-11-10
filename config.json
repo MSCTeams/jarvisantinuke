@@ -1,0 +1,25 @@
+{
+  "token": "",
+  "prefix": "!",
+  "alert_channel_id": ""
+  "owner_bypass": true,
+  "antinuke": {
+    "enabled": true,
+    "window_seconds": 12,
+    "actions_threshold": 3,
+    "response": "kick",
+    "log_events": true
+  },
+  "antiraid": {
+    "enabled": true,
+    "join_window_seconds": 15,
+    "joins_threshold": 8,
+    "lockdown_on_raid": false,
+    "raid_role_id": 0
+  },
+  "backup": {
+    "max_messages_per_channel": 1000,
+    "include_message_content": true,
+    "include_attachments": true
+  }
+}
