@@ -32,7 +32,7 @@ log = logging.getLogger("jarvis-antinuke")
 DEFAULT_CONFIG = {
     "token": "",
     "prefix": "!",
-    "alert_channel_id": ""
+    "alert_channel_id": "",
     "owner_bypass": True,
     "antinuke": {
         "enabled": True,
@@ -106,8 +106,11 @@ def get_alert_channel(guild: disnake.Guild):
     channel_id = int(config.get("alert_channel_id", 0) or 0)
     if channel_id:
         channel = guild.get_channel(channel_id)
-        if channel:
-            return channel
+        if isinstance(channel, disnake.TextChannel):
+            perms = channel.permissions_for(guild.me)
+            if perms.send_messages and perms.embed_links:
+                return channel
+
     # fallback to the first text channel where the bot can send messages
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
@@ -146,7 +149,7 @@ async def find_audit_actor(guild: disnake.Guild, action: disnake.AuditLogAction,
 
 def is_trusted(guild: disnake.Guild, member: disnake.Member | None) -> bool:
     if member is None:
-        return True
+        return False
     if member.id == guild.owner_id and config.get("owner_bypass", True):
         return True
     if bot.user and member.id == bot.user.id:
@@ -200,6 +203,7 @@ async def handle_destructive_event(
 
     response = str(config["antinuke"].get("response", "kick")).lower()
     # Clear the queue so one burst does not repeatedly trigger actions.
+    triggered_actions = len(events)
     events.clear()
     if response == "alert":
         return
@@ -223,7 +227,7 @@ async def handle_destructive_event(
         return
 
     try:
-        await member.kick(reason=f"Jarvis AntiNuke: {len(events) or threshold} destructive actions within {window}s")
+        await member.kick(reason=f"Jarvis AntiNuke: {triggered_actions} destructive actions within {window}s")
         await send_log(guild, "🛡️ AntiNuke: нарушитель исключён", f"Участник: **{member}** (`{member.id}`)\nПричина: серия опасных действий.", disnake.Color.green())
     except (disnake.Forbidden, disnake.HTTPException) as exc:
         await send_log(guild, "AntiNuke: ошибка действия", f"Не удалось исключить {member.mention}: `{exc}`", disnake.Color.red())
@@ -279,10 +283,21 @@ async def create_backup(guild: disnake.Guild, include_messages: bool = False) ->
     for channel in sorted(guild.channels, key=lambda c: (getattr(c, "position", 0), c.id)):
         if isinstance(channel, disnake.CategoryChannel):
             continue
+        if isinstance(channel, disnake.TextChannel):
+            channel_type = "news" if channel.is_news() else "text"
+        elif isinstance(channel, disnake.VoiceChannel):
+            channel_type = "voice"
+        elif isinstance(channel, disnake.StageChannel):
+            channel_type = "stage_voice"
+        elif isinstance(channel, disnake.ForumChannel):
+            channel_type = "forum"
+        else:
+            channel_type = "text"
+
         item: dict[str, Any] = {
             "id": channel.id,
             "name": channel.name,
-            "type": str(channel.type),
+            "type": channel_type,
             "position": getattr(channel, "position", 0),
             "category_id": channel.category_id,
             "overwrites": serialise_overwrites(channel),
@@ -369,6 +384,16 @@ async def restore_structure(guild: disnake.Guild, data: dict[str, Any], restore_
         existing = disnake.utils.get(guild.roles, name=item["name"])
         if existing:
             role_map[int(item["id"])] = existing
+            try:
+                await existing.edit(
+                    permissions=disnake.Permissions(int(item["permissions"])),
+                    colour=disnake.Colour(int(item["color"])),
+                    hoist=bool(item["hoist"]),
+                    mentionable=bool(item["mentionable"]),
+                    reason="Jarvis AntiNuke backup restore",
+                )
+            except (disnake.Forbidden, disnake.HTTPException) as exc:
+                warnings.append(f"Role `{item['name']}`: {exc}")
             continue
         try:
             role = await guild.create_role(
@@ -423,6 +448,16 @@ async def restore_structure(guild: disnake.Guild, data: dict[str, Any], restore_
                 )
         try:
             ctype = item.get("type", "text")
+            existing = disnake.utils.get(guild.channels, name=item["name"])
+            if existing is not None:
+                channel_map[int(item["id"])] = existing
+                if hasattr(existing, "edit"):
+                    await existing.edit(
+                        overwrites=overwrites,
+                        category=old_category,
+                        reason="Jarvis AntiNuke backup restore",
+                    )
+                continue
             if ctype in ("text", "news"):
                 channel = await guild.create_text_channel(
                     item["name"], category=old_category, overwrites=overwrites,
@@ -530,10 +565,12 @@ async def on_member_join(member: disnake.Member):
     threshold = max(3, int(settings.get("joins_threshold", 8)))
 
     if len(events) >= threshold and guild.id not in raid_lockdown_active:
+        raid_join_count = len(events)
+        events.clear()
         await send_log(
             guild,
             "🚨 AntiRaid: возможен рейд",
-            f"За последние **{window} секунд** вошло **{len(events)} участников**.\n"
+            f"За последние **{window} секунд** вошло **{raid_join_count} участников**.\n"
             f"Порог: **{threshold}**. Проверьте участников и включите Lockdown при необходимости.",
             disnake.Color.red(),
         )
@@ -546,6 +583,12 @@ async def on_member_join(member: disnake.Member):
                     await member.add_roles(raid_role, reason="Jarvis AntiRaid temporary raid quarantine")
                 except (disnake.Forbidden, disnake.HTTPException):
                     pass
+
+            async def reset_raid_state(guild_id: int, delay: int = 60) -> None:
+                await asyncio.sleep(delay)
+                raid_lockdown_active.discard(guild_id)
+
+            asyncio.create_task(reset_raid_state(guild.id))
 
     await send_log(guild, "Участник присоединился", f"{member.mention} (`{member.id}`) · аккаунт создан <t:{int(member.created_at.timestamp())}:R>", disnake.Color.blurple())
 
@@ -638,7 +681,11 @@ async def server_clone(
         await inter.response.send_message("Сервер назначения не найден. Убедись, что бот добавлен на него.", ephemeral=True)
         return
     if target.id == inter.guild.id:
-        await inter.response.send_message("Исходный и целевой серверы должны отличаться.", ephemeral=True)
+        await inter.response.send_message("Исходный и целевые серверы должны отличаться.", ephemeral=True)
+        return
+    target_member = target.get_member(inter.author.id)
+    if target_member is None or not target_member.guild_permissions.administrator:
+        await inter.response.send_message("Для копирования нужны права администратора и на целевом сервере.", ephemeral=True)
         return
     if not target.me or not target.me.guild_permissions.manage_channels or not target.me.guild_permissions.manage_roles:
         await inter.response.send_message("На целевом сервере боту нужны права Manage Channels и Manage Roles.", ephemeral=True)

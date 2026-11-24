@@ -1,7 +1,7 @@
 {
   "token": "",
   "prefix": "!",
-  "alert_channel_id": ""
+  "alert_channel_id": "",
   "owner_bypass": true,
   "antinuke": {
     "enabled": true,
